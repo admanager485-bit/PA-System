@@ -1,0 +1,256 @@
+#!/bin/bash
+echo "================================================"
+echo "🌟 INITIATING ALL-IN-ONE PA SYSTEM CONSOLE"
+echo "================================================"
+
+# 1. Install System Audio, Video, and Web Tools
+echo "📦 Installing System Packages..."
+sudo apt-get update && sudo apt-get install espeak alsa-utils python3-pip ffmpeg chromium-browser -y
+
+# 2. Install Python Web Libraries
+echo "🐍 Installing Python Dependencies..."
+pip3 install flask werkzeug --break-system-packages
+
+# 3. Force Audio out of the 3.5mm Headphone Jack (not HDMI)
+echo "🔊 Routing Audio to Headphone Jack..."
+sudo amixer cset numid=3 1 > /dev/null 2>&1
+sudo raspi-config nonint do_audio 1
+
+# 4. Write the Master Python Web App & Audio Player
+echo "🧠 Injecting System Brain..."
+cat << 'EOF' | sudo tee /usr/local/bin/pa_system.py > /dev/null
+#!/usr/bin/env python3
+import os, time, threading, subprocess, uuid
+from flask import Flask, request, jsonify, render_template_string
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = '/tmp/'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+SCHEDULED_TASKS = []
+
+# --- 1. TASK SCHEDULER ---
+def task_scheduler():
+    global SCHEDULED_TASKS
+    while True:
+        now = time.time()
+        for task in SCHEDULED_TASKS[:]:
+            if now >= task['execute_at']:
+                if task['type'] == 'text':
+                    play_text(task['data'])
+                elif task['type'] == 'audio':
+                    play_audio(task['data'])
+                SCHEDULED_TASKS.remove(task)
+        time.sleep(1)
+
+threading.Thread(target=task_scheduler, daemon=True).start()
+
+# --- 2. LOCAL AUDIO ENGINES (Outputs to Headphone Jack) ---
+def play_text(text):
+    subprocess.run(["espeak", text])
+
+def play_audio(filepath):
+    # Convert any uploaded file (MP3, WebM) to WAV for native Linux playback
+    wav_path = f"{filepath}.wav"
+    subprocess.run(["ffmpeg", "-y", "-i", filepath, wav_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["aplay", "-q", wav_path])
+    try: os.remove(wav_path); os.remove(filepath)
+    except: pass
+
+# --- 3. WEB ENDPOINTS ---
+@app.route('/')
+def dashboard():
+    return render_template_string(HTML_UI)
+
+@app.route('/api/status')
+def status():
+    return jsonify({"tasks": len(SCHEDULED_TASKS)})
+
+@app.route('/api/trigger_text', methods=['POST'])
+def trigger_text():
+    text = request.form.get('text')
+    delay = int(request.form.get('delay', 0))
+    if delay > 0:
+        SCHEDULED_TASKS.append({'type': 'text', 'data': text, 'execute_at': time.time() + delay})
+    else:
+        threading.Thread(target=play_text, args=(text,)).start()
+    return "OK"
+
+@app.route('/api/trigger_audio', methods=['POST'])
+def trigger_audio():
+    delay = int(request.form.get('delay', 0))
+    if 'file' not in request.files: return "No file", 400
+    file = request.files['file']
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"cmd_{uuid.uuid4().hex}")
+    file.save(filepath)
+    if delay > 0:
+        SCHEDULED_TASKS.append({'type': 'audio', 'data': filepath, 'execute_at': time.time() + delay})
+    else:
+        threading.Thread(target=play_audio, args=(filepath,)).start()
+    return "OK"
+
+# --- 4. HTML USER INTERFACE ---
+HTML_UI = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PA System Command</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #121212; color: #ffffff; padding: 20px; font-family: sans-serif; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
+        .nav-tabs .nav-link { color: #00ff00; font-weight: bold; }
+        .nav-tabs .nav-link.active { background-color: #1e1e1e; color: #fff; border-color: #333; border-bottom-color: transparent; }
+        .status-bar { background-color: #000; padding: 15px; border-radius: 5px; margin-bottom: 20px; text-align: center; font-size: 1.2em; font-weight: bold; color: #00ff00; }
+    </style>
+</head>
+<body>
+    <div class="container" style="max-width: 600px; margin-top: 20px;">
+        <h2 class="mb-4 text-center">🎤 INTERCOM CONSOLE</h2>
+        
+        <div class="status-bar">
+            <span>🟢 SYSTEM ONLINE & READY</span><br>
+            <span id="task-status" style="color:#aaa; font-size: 0.8em; font-weight: normal;">0 Scheduled Tasks</span>
+        </div>
+
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#live-talk">Talk</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#live-tts">Text</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#upload-mp3">MP3</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#schedule-tts">Sch-Text</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#schedule-audio">Sch-Audio</button></li>
+        </ul>
+
+        <div class="tab-content card p-4 border-top-0 rounded-bottom">
+            <div class="tab-pane fade show active" id="live-talk">
+                <h4>🎙️ Live Broadcast</h4>
+                <button id="record-btn" class="btn btn-danger w-100 py-4 mt-2 fw-bold" style="font-size: 1.2em;">🔴 HOLD TO RECORD</button>
+            </div>
+
+            <div class="tab-pane fade" id="live-tts">
+                <h4>📝 Text to Speech</h4>
+                <textarea id="tts-text" class="form-control bg-dark text-white border-secondary mb-3" rows="3" placeholder="Type message..."></textarea>
+                <button onclick="sendTTS(0)" class="btn btn-success w-100 py-3 fw-bold">🚀 SEND TO SPEAKERS</button>
+            </div>
+
+            <div class="tab-pane fade" id="upload-mp3">
+                <h4>🎵 Play Audio File</h4>
+                <input type="file" id="audio-file" class="form-control bg-dark text-white border-secondary mb-3" accept="audio/*">
+                <button onclick="sendAudio(0)" class="btn btn-success w-100 py-3 fw-bold">▶️ PLAY FILE NOW</button>
+            </div>
+
+            <div class="tab-pane fade" id="schedule-tts">
+                <h4>⏰ Schedule Text</h4>
+                <textarea id="sched-tts-text" class="form-control bg-dark text-white border-secondary mb-3" rows="3" placeholder="Type message..."></textarea>
+                <label>Delay (Seconds):</label>
+                <input type="number" id="tts-delay" class="form-control bg-dark text-white border-secondary mb-3" value="60">
+                <button onclick="sendScheduledTTS()" class="btn btn-warning w-100 py-3 fw-bold">QUEUE TEXT</button>
+            </div>
+
+            <div class="tab-pane fade" id="schedule-audio">
+                <h4>⏰ Schedule Audio File</h4>
+                <input type="file" id="sched-audio-file" class="form-control bg-dark text-white border-secondary mb-3" accept="audio/*">
+                <label>Delay (Seconds):</label>
+                <input type="number" id="audio-delay" class="form-control bg-dark text-white border-secondary mb-3" value="60">
+                <button onclick="sendScheduledAudio()" class="btn btn-warning w-100 py-3 fw-bold">QUEUE AUDIO</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        setInterval(() => {
+            fetch('/api/status').then(r => r.json()).then(data => {
+                document.getElementById('task-status').innerText = data.tasks + " Scheduled Task(s)";
+            });
+        }, 2000);
+
+        function sendTTS(delay) {
+            let text = delay === 0 ? document.getElementById('tts-text').value : document.getElementById('sched-tts-text').value;
+            let fd = new FormData(); fd.append('text', text); fd.append('delay', delay);
+            fetch('/api/trigger_text', {method: 'POST', body: fd}).then(() => {
+                document.getElementById('tts-text').value = ''; document.getElementById('sched-tts-text').value = '';
+                alert(delay > 0 ? "Scheduled!" : "Sent!");
+            });
+        }
+        function sendScheduledTTS() { sendTTS(document.getElementById('tts-delay').value); }
+
+        function sendAudio(delay) {
+            let fileInput = delay === 0 ? document.getElementById('audio-file') : document.getElementById('sched-audio-file');
+            if(fileInput.files.length === 0) return alert("Select a file first!");
+            let fd = new FormData(); fd.append('file', fileInput.files[0]); fd.append('delay', delay);
+            fetch('/api/trigger_audio', {method: 'POST', body: fd}).then(() => {
+                fileInput.value = ''; alert(delay > 0 ? "Scheduled!" : "Sent!");
+            });
+        }
+        function sendScheduledAudio() { sendAudio(document.getElementById('audio-delay').value); }
+
+        let mediaRecorder; let audioChunks = []; const recBtn = document.getElementById('record-btn');
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+            mediaRecorder = new MediaRecorder(stream);
+            mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+            mediaRecorder.onstop = () => {
+                let audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                let fd = new FormData(); fd.append('file', audioBlob, 'live_record.webm'); fd.append('delay', 0);
+                fetch('/api/trigger_audio', {method: 'POST', body: fd});
+                audioChunks = [];
+            };
+        });
+
+        recBtn.onmousedown = () => { if(mediaRecorder.state === 'inactive') mediaRecorder.start(); recBtn.innerText = "🎙️ RECORDING... RELEASE TO SEND"; };
+        recBtn.onmouseup = () => { if(mediaRecorder.state === 'recording') mediaRecorder.stop(); recBtn.innerText = "🔴 HOLD TO RECORD"; };
+        recBtn.ontouchstart = recBtn.onmousedown;
+        recBtn.ontouchend = recBtn.onmouseup;
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+EOF
+
+sudo chmod +x /usr/local/bin/pa_system.py
+
+# 5. Create SystemD Auto-Start Service for the Python App
+echo "⚙️ Configuring Background Service..."
+cat << EOF | sudo tee /etc/systemd/system/pa_system.service > /dev/null
+[Unit]
+Description=All-In-One PA System
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/pa_system.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable pa_system.service
+sudo systemctl restart pa_system.service
+
+# 6. Configure Chromium Kiosk Mode to Auto-Start on Desktop Boot
+echo "🖥️ Configuring Kiosk Display..."
+mkdir -p ~/.config/autostart
+cat << EOF > ~/.config/autostart/pa_kiosk.desktop
+[Desktop Entry]
+Type=Application
+Name=PA Kiosk
+Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --incognito http://localhost:5000
+X-GNOME-Autostart-enabled=true
+EOF
+
+# Get IP Address
+IP_ADDR=$(hostname -I | awk '{print $1}')
+
+echo "================================================"
+echo "✅ INSTALLATION COMPLETE."
+echo "🔊 Plug your speakers into the 3.5mm Headphone Jack."
+echo "🖥️ The Kiosk App will open automatically when you reboot."
+echo "📱 You can also control it from your phone at: http://$IP_ADDR:5000"
+echo "================================================"
