@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import os, time, threading, socket, requests, uuid
+from flask import Flask, request, jsonify, render_template_string
+from werkzeug.utils import secure_filename
+import urllib3
+
+urllib3.disable_warnings()
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = '/tmp/'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+ACTIVE_RECEIVERS = set()
+SCHEDULED_TASKS = []
+
+# --- 1. NETWORK DISCOVERY (Tells Pi where the Mac is) ---
+def beacon_broadcaster():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    while True:
+        try: s.sendto(b"MAC_SENDER_BEACON", ('<broadcast>', 5005))
+        except: pass
+        time.sleep(3)
+
+# --- 2. TASK SCHEDULER ---
+def task_scheduler():
+    global SCHEDULED_TASKS
+    while True:
+        now = time.time()
+        for task in SCHEDULED_TASKS[:]:
+            if now >= task['execute_at']:
+                if task['type'] == 'text': broadcast_text(task['data'])
+                elif task['type'] == 'audio': broadcast_audio(task['data'])
+                SCHEDULED_TASKS.remove(task)
+        time.sleep(1)
+
+threading.Thread(target=beacon_broadcaster, daemon=True).start()
+threading.Thread(target=task_scheduler, daemon=True).start()
+
+# --- 3. TRANSMISSION ENGINES ---
+def broadcast_text(text):
+    if not ACTIVE_RECEIVERS: return
+    for ip in list(ACTIVE_RECEIVERS):
+        try: requests.post(f"http://{ip}:5000/api/speak", json={"text": text}, timeout=3)
+        except: ACTIVE_RECEIVERS.discard(ip)
+
+def broadcast_audio(filepath):
+    if not ACTIVE_RECEIVERS: return
+    for ip in list(ACTIVE_RECEIVERS):
+        try:
+            with open(filepath, 'rb') as f:
+                files = {'audio_file': (os.path.basename(filepath), f)}
+                requests.post(f"http://{ip}:5000/api/play", files=files, timeout=10)
+        except: ACTIVE_RECEIVERS.discard(ip)
+
+# --- 4. WEB ENDPOINTS ---
+@app.route('/register', methods=['POST'])
+def register_node():
+    ACTIVE_RECEIVERS.add(request.remote_addr)
+    return "OK"
+
+@app.route('/')
+def dashboard(): return render_template_string(HTML_UI)
+
+@app.route('/api/status')
+def status(): return jsonify({"receivers": len(ACTIVE_RECEIVERS), "tasks": len(SCHEDULED_TASKS)})
+
+@app.route('/api/trigger_text', methods=['POST'])
+def trigger_text():
+    text = request.form.get('text')
+    delay = int(request.form.get('delay', 0))
+    if delay > 0: SCHEDULED_TASKS.append({'type': 'text', 'data': text, 'execute_at': time.time() + delay})
+    else: threading.Thread(target=broadcast_text, args=(text,)).start()
+    return "OK"
+
+@app.route('/api/trigger_audio', methods=['POST'])
+def trigger_audio():
+    delay = int(request.form.get('delay', 0))
+    if 'file' not in request.files: return "No file", 400
+    file = request.files['file']
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"cmd_{uuid.uuid4().hex}")
+    file.save(filepath)
+    if delay > 0: SCHEDULED_TASKS.append({'type': 'audio', 'data': filepath, 'execute_at': time.time() + delay})
+    else: threading.Thread(target=broadcast_audio, args=(filepath,)).start()
+    return "OK"
+
+# --- 5. HTML UI (Accessible on your Mac at http://localhost:8080) ---
+HTML_UI = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mac PA Sender</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #121212; color: #ffffff; padding: 20px; font-family: sans-serif; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
+        .nav-tabs .nav-link { color: #00ff00; font-weight: bold; }
+        .nav-tabs .nav-link.active { background-color: #1e1e1e; color: #fff; border-color: #333; border-bottom-color: transparent; }
+        .status-bar { background-color: #000; padding: 15px; border-radius: 5px; margin-bottom: 20px; text-align: center; font-size: 1.2em; font-weight: bold; }
+        .text-green { color: #00ff00; } .text-red { color: #ff0000; }
+    </style>
+</head>
+<body>
+    <div class="container" style="max-width: 600px;">
+        <h2 class="mb-4 text-center">🎤 MAC COMMANDER</h2>
+        <div class="status-bar">
+            <span id="speaker-status" class="text-red">🔴 SEARCHING FOR PI...</span><br>
+            <span id="task-status" style="color:#aaa; font-size: 0.8em; font-weight: normal;">0 Scheduled Tasks</span>
+        </div>
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#live-talk">Talk</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#live-tts">Text</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#upload-mp3">MP3</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#schedule-tts">Sch-Text</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#schedule-audio">Sch-Audio</button></li>
+        </ul>
+        <div class="tab-content card p-4 border-top-0 rounded-bottom">
+            <div class="tab-pane fade show active" id="live-talk">
+                <h4>🎙️ Live Broadcast</h4>
+                <button id="record-btn" class="btn btn-danger w-100 py-4 mt-2 fw-bold" style="font-size: 1.2em;">🔴 HOLD TO RECORD</button>
+            </div>
+            <div class="tab-pane fade" id="live-tts">
+                <h4>📝 Text to Speech</h4>
+                <textarea id="tts-text" class="form-control bg-dark text-white border-secondary mb-3" rows="3"></textarea>
+                <button onclick="sendTTS(0)" class="btn btn-success w-100 py-3 fw-bold">🚀 SEND</button>
+            </div>
+            <div class="tab-pane fade" id="upload-mp3">
+                <h4>🎵 Play MP3/WAV</h4>
+                <input type="file" id="audio-file" class="form-control bg-dark text-white border-secondary mb-3" accept="audio/*">
+                <button onclick="sendAudio(0)" class="btn btn-success w-100 py-3 fw-bold">▶️ PLAY NOW</button>
+            </div>
+            <div class="tab-pane fade" id="schedule-tts">
+                <h4>⏰ Schedule Text</h4>
+                <textarea id="sched-tts-text" class="form-control bg-dark text-white border-secondary mb-3" rows="3"></textarea>
+                <label>Delay (Seconds):</label>
+                <input type="number" id="tts-delay" class="form-control bg-dark text-white border-secondary mb-3" value="60">
+                <button onclick="sendScheduledTTS()" class="btn btn-warning w-100 py-3 fw-bold">QUEUE</button>
+            </div>
+            <div class="tab-pane fade" id="schedule-audio">
+                <h4>⏰ Schedule Audio</h4>
+                <input type="file" id="sched-audio-file" class="form-control bg-dark text-white border-secondary mb-3" accept="audio/*">
+                <label>Delay (Seconds):</label>
+                <input type="number" id="audio-delay" class="form-control bg-dark text-white border-secondary mb-3" value="60">
+                <button onclick="sendScheduledAudio()" class="btn btn-warning w-100 py-3 fw-bold">QUEUE</button>
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        setInterval(() => {
+            fetch('/api/status').then(r => r.json()).then(data => {
+                const spk = document.getElementById('speaker-status');
+                if(data.receivers > 0) { spk.className = "text-green"; spk.innerText = "🟢 PI CONNECTED & READY"; } 
+                else { spk.className = "text-red"; spk.innerText = "🔴 SEARCHING FOR PI..."; }
+                document.getElementById('task-status').innerText = data.tasks + " Scheduled Task(s)";
+            });
+        }, 2000);
+        function sendTTS(delay) {
+            let fd = new FormData(); 
+            fd.append('text', delay === 0 ? document.getElementById('tts-text').value : document.getElementById('sched-tts-text').value); 
+            fd.append('delay', delay);
+            fetch('/api/trigger_text', {method: 'POST', body: fd}).then(() => alert(delay > 0 ? "Scheduled!" : "Sent!"));
+        }
+        function sendScheduledTTS() { sendTTS(document.getElementById('tts-delay').value); }
+        function sendAudio(delay) {
+            let fInput = delay === 0 ? document.getElementById('audio-file') : document.getElementById('sched-audio-file');
+            if(fInput.files.length === 0) return alert("Select a file!");
+            let fd = new FormData(); fd.append('file', fInput.files[0]); fd.append('delay', delay);
+            fetch('/api/trigger_audio', {method: 'POST', body: fd}).then(() => alert(delay > 0 ? "Scheduled!" : "Sent!"));
+        }
+        function sendScheduledAudio() { sendAudio(document.getElementById('audio-delay').value); }
+        let mediaRec; let chunks = []; const recBtn = document.getElementById('record-btn');
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+            mediaRec = new MediaRecorder(stream);
+            mediaRec.ondataavailable = e => chunks.push(e.data);
+            mediaRec.onstop = () => {
+                let fd = new FormData(); fd.append('file', new Blob(chunks, { type: 'audio/webm' }), 'live.webm'); fd.append('delay', 0);
+                fetch('/api/trigger_audio', {method: 'POST', body: fd}); chunks = [];
+            };
+        });
+        recBtn.onmousedown = () => { mediaRec.start(); recBtn.innerText = "🎙️ RECORDING... RELEASE TO SEND"; };
+        recBtn.onmouseup = () => { mediaRec.stop(); recBtn.innerText = "🔴 HOLD TO RECORD"; };
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == '__main__':
+    print("🚀 MAC SENDER ONLINE: Open http://localhost:8080 in your web browser")
+    app.run(host='0.0.0.0', port=8080)
